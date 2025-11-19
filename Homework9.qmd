@@ -1,0 +1,194 @@
+---
+title: "ST558 Homework9"
+format: html
+editor: visual
+---
+
+# Jamin Goo (NCSU id : jgoo)
+
+```{r}
+#| message: FALSE
+#| warning: FALSE
+
+# Load necessary libraries
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(janitor)
+library(baguette)
+```
+
+## 1. Reading Data (Homework8)
+
+```{r}
+bike_data_raw <- read_csv("SeoulBikeData.csv", 
+                          locale = locale(encoding = "latin1"))
+```
+
+## 2. EDA (Homework8)
+
+### Checking the Data
+
+```{r}
+# 1. Check for missingness
+print(colSums(is.na(bike_data_raw)))
+```
+
+All columns are 0 : There is no missing.
+
+```{r}
+# 2. Check column types and values
+glimpse(bike_data_raw)
+summary(bike_data_raw |> select(where(is.numeric)))
+print(map(bike_data_raw |> select(where(is.character), -Date), unique))
+```
+
+```{r}
+# 3, 4, 5. Convert Date, Convert to Factors, Rename
+bike_data_cleaned <- bike_data_raw |>
+  mutate(
+    Date = dmy(Date), # 3. Convert the Date column into an actual date 
+    Seasons = factor(Seasons), # 4: Turn the character variables 
+    Holiday = factor(Holiday), # 4: Turn the character variables 
+  ) |>
+  clean_names() |> # 5: Rename all the variables to have easy to use names 
+  mutate(
+    functioning_day = factor(functioning_day) # 4: Turn the character variables 
+  )
+
+glimpse(bike_data_cleaned)
+```
+
+2.  
+
+```{r}
+# 6: Create summary statistics (especially related to the bike rental count)
+print(
+  bike_data_cleaned |>
+    group_by(functioning_day) |>
+    summarize(
+      count = n(),
+      min_bikes = min(rented_bike_count),
+      mean_bikes = mean(rented_bike_count),
+      max_bikes = max(rented_bike_count)
+    )
+)
+
+# 6: Subset the data appropriately
+bike_data_functional <- bike_data_cleaned |>
+  filter(functioning_day == "Yes")
+
+summary(bike_data_functional)
+
+bike_data_functional_no <- bike_data_cleaned |>
+  filter(functioning_day == "No")
+
+summary(bike_data_functional_no)
+```
+
+If the bike is not functioning, the rented bike count is always 0.
+
+So we will focus on the data where the bike is functioning for further analysis.
+
+```{r}
+# 7: To simplify our analysis, we’ll summarize across the hours
+bike_data_daily <- bike_data_functional |>
+  group_by(date, seasons, holiday) |>
+  summarize(
+    # Find the sum of rented_bike_count, rainfall, and snowfall
+    rented_bike_count_sum = sum(rented_bike_count),
+    rainfall_sum_mm = sum(rainfall_mm),
+    snowfall_sum_cm = sum(snowfall_cm),
+    
+    # Find the mean of all the weather related variables
+    temperature_mean_c = mean(temperature_c),
+    humidity_mean_percent = mean(humidity_percent),
+    wind_speed_mean_m_s = mean(wind_speed_m_s),
+    visibility_mean_10m = mean(visibility_10m),
+    dew_point_temperature_mean_c = mean(dew_point_temperature_c),
+    solar_radiation_mean_mj_m2 = mean(solar_radiation_mj_m2),
+    
+    .groups = 'drop' 
+  )
+
+glimpse(bike_data_daily)
+```
+
+```{r}
+# 8: Recreate my basic summary stats
+summary(bike_data_daily)
+
+# Plot: Rented Bike Count vs. Mean Temperature
+plot_temp <- bike_data_daily |>
+  ggplot(aes(x = temperature_mean_c , y = rented_bike_count_sum)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  labs(
+    title = "Daily Bike Rentals vs. Mean Temperature",
+    x = "Mean Temperature (C)",
+    y = "Sum of Daily Bike Rentals"
+  )
+print(plot_temp)
+
+#  correlation between my numeric variables
+cor_matrix <- bike_data_daily |>
+  select(where(is.numeric)) |>
+  cor()
+print(round(cor_matrix, 2))
+```
+
+## 3. Split the Data (Homework8)
+
+```{r}
+set.seed(10)
+bike_split <- initial_split(bike_data_daily, prop = 0.75, strata = seasons)
+bike_train <- training(bike_split)
+bike_test <- testing(bike_split)
+bike_CV_folds <- vfold_cv(bike_train, v = 10, strata = seasons)
+```
+
+## 4. MLR recipe (Homework8)
+
+```{r}
+MLR_recipe1 <- recipe(rented_bike_count_sum ~ ., data = bike_train) |>
+  # Ignore the date variable for modeling
+  step_date(date, features = c("dow")) |>
+  step_mutate(day_type = factor(if_else(date_dow %in% c("Sat", "Sun"), 
+                                        "weekend", "weekday"))) |>
+  step_rm(date, date_dow) |> 
+  # Standardize the numeric variables since their scales are pretty different.
+  step_normalize(all_numeric_predictors()) |>
+  # Create dummy variables for the seasons, holiday, and our new day type variable
+  step_dummy(all_nominal_predictors())
+```
+
+## 5. Model Specifications
+
+```{r}
+# A. LASSO Model
+lasso_spec <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet")
+
+# B. Regression Tree Model
+tree_spec <- decision_tree(cost_complexity = tune(), tree_depth = tune(), min_n = tune()) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+# C. Bagged Tree Model
+bag_spec <- bag_tree(cost_complexity = tune(), tree_depth = tune(), min_n = tune()) |>
+  set_engine("rpart", times = 50) |>
+  set_mode("regression")
+
+# D. Random Forest Model
+rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 1000) |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("regression")
+```
+
+## 6. Workflows
+```{r}
+lasso_wkf <- workflow() |> add_recipe(MLR_recipe1) |> add_model(lasso_spec)
+tree_wkf  <- workflow() |> add_recipe(MLR_recipe1) |> add_model(tree_spec)
+bag_wkf   <- workflow() |> add_recipe(MLR_recipe1) |> add_model(bag_spec)
+rf_wkf    <- workflow() |> add_recipe(MLR_recipe1) |> add_model(rf_spec)
+```
