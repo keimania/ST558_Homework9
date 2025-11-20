@@ -16,6 +16,9 @@ library(tidymodels)
 library(lubridate)
 library(janitor)
 library(baguette)
+library(glmnet)
+library(ranger)
+library(rpart.plot)
 ```
 
 ## 1. Reading Data (Homework8)
@@ -186,9 +189,147 @@ rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 1000) |>
 ```
 
 ## 6. Workflows
+
 ```{r}
 lasso_wkf <- workflow() |> add_recipe(MLR_recipe1) |> add_model(lasso_spec)
 tree_wkf  <- workflow() |> add_recipe(MLR_recipe1) |> add_model(tree_spec)
 bag_wkf   <- workflow() |> add_recipe(MLR_recipe1) |> add_model(bag_spec)
 rf_wkf    <- workflow() |> add_recipe(MLR_recipe1) |> add_model(rf_spec)
+```
+
+## 7. Tuning
+
+```{r}
+# Setting up grids
+lasso_grid <- grid_regular(penalty(), levels = 50)
+tree_grid  <- grid_regular(cost_complexity(), tree_depth(), min_n(), levels = 5)
+bag_grid   <- grid_regular(cost_complexity(), tree_depth(), min_n(), levels = 5)
+rf_grid    <- grid_regular(mtry(range = c(1, 10)), min_n(), levels = 5)
+
+# Tune Models
+lasso_res <- tune_grid(lasso_wkf, resamples = bike_CV_folds, grid = lasso_grid)
+tree_res  <- tune_grid(tree_wkf,  resamples = bike_CV_folds, grid = tree_grid)
+bag_res   <- tune_grid(bag_wkf,   resamples = bike_CV_folds, grid = bag_grid)
+rf_res    <- tune_grid(rf_wkf,    resamples = bike_CV_folds, grid = rf_grid)
+```
+
+## 8. Workflows
+
+```{r}
+# Select best parameters for each model 
+best_lasso <- select_best(lasso_res, metric = "rmse")
+final_lasso_wkf <- finalize_workflow(lasso_wkf, best_lasso)
+final_lasso_fit <- last_fit(final_lasso_wkf, bike_split)
+
+best_tree  <- select_best(tree_res, metric = "rmse")
+final_tree_wkf  <- finalize_workflow(tree_wkf, best_tree)
+final_tree_fit  <- last_fit(final_tree_wkf, bike_split)
+
+best_bag   <- select_best(bag_res, metric = "rmse")
+final_bag_wkf   <- finalize_workflow(bag_wkf, best_bag) 
+final_bag_fit   <- last_fit(final_bag_wkf, bike_split)
+
+best_rf    <- select_best(rf_res, metric = "rmse")
+final_rf_wkf    <- finalize_workflow(rf_wkf, best_rf)
+final_rf_fit    <- last_fit(final_rf_wkf, bike_split)
+```
+
+## 9. Best MLR model (Homework8)
+
+```{r}
+MLR_recipe3 <- MLR_recipe1 |>
+  step_interact(~ starts_with("seasons_"):starts_with("holiday_")) |>
+  step_interact(~ starts_with("seasons_"):temperature_mean_c) |>
+  step_interact(~ temperature_mean_c:rainfall_sum_mm) |>
+  step_poly(rainfall_sum_mm, snowfall_sum_cm, temperature_mean_c, humidity_mean_percent,
+            wind_speed_mean_m_s, visibility_mean_10m, dew_point_temperature_mean_c,
+            solar_radiation_mean_mj_m2, degree = 2)
+
+MLR_wkf3 <- workflow() |> add_recipe(MLR_recipe3) |> add_model(linear_reg() |> set_engine("lm"))
+final_mlr_fit <- last_fit(MLR_wkf3, bike_split)
+```
+
+## 10. Comparison
+
+```{r}
+# Collect metrics (RMSE and R squared) 
+compare_models <- bind_rows(
+  collect_metrics(final_lasso_fit) |> mutate(model = "LASSO"),
+  collect_metrics(final_tree_fit) |> mutate(model = "Regression Tree"),
+  collect_metrics(final_bag_fit) |> mutate(model = "Bagged Tree"),
+  collect_metrics(final_rf_fit) |> mutate(model = "Random Forest"),
+  collect_metrics(final_mlr_fit) |> mutate(model = "MLR (HW8 Best)")
+) |>
+  select(model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+print(compare_models)
+```
+
+### Random Forest is the best model based on RMSE(lowest) and R Squared(highest).
+
+## 11. Report
+
+```{r}
+# A. LASSO Coefficient Table 
+lasso_coefs <- extract_fit_parsnip(final_lasso_fit) |>
+  tidy() |>
+  filter(estimate != 0)
+print(lasso_coefs)
+
+# B. Regression Tree Plot 
+tree_engine <- extract_fit_engine(final_tree_fit)
+rpart.plot(tree_engine, roundint = FALSE)
+
+# C. Bagged Tree
+bag_engine <- extract_fit_engine(final_bag_fit)
+
+bag_importance <- bag_engine$imp |>
+  select(term, value) |>
+  rename(Variable = term, Importance = value) |>
+  arrange(desc(Importance))
+
+# Plot using ggplot
+bag_plot <- bag_importance |>
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "black", alpha = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Bagged Tree Variable Importance",
+    x = "Predictor",
+    y = "Importance"
+  ) +
+  theme_minimal()
+
+print(bag_plot)
+
+# D. Random Forest
+rf_engine <- extract_fit_engine(final_rf_fit)
+
+rf_importance <- tibble(
+  Variable = names(rf_engine$variable.importance),
+  Importance = rf_engine$variable.importance
+) |>
+  arrange(desc(Importance))
+
+rf_plot <- rf_importance |>
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "black", alpha = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Random Forest Variable Importance",
+    x = "Predictor",
+    y = "Importance (Impurity)"
+  ) +
+  theme_minimal()
+
+print(rf_plot)
+```
+
+## 12. Fit the best model(Random Forest) on the full dataset
+
+```{r}
+final_model_full <- fit(final_rf_wkf, data = bike_data_daily)
+
+print(final_model_full)
 ```
